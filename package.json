@@ -1,0 +1,57 @@
+{
+  "name": "global-comm-dolibarr-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Global Comm's restricted Dolibarr MCP integration, derived from digitalfactorysn/mcp-dolibarr.",
+  "main": "build/index.js",
+  "type": "module",
+  "bin": {
+    "mcp-dolibarr": "build/index.js",
+    "mcp-dolibarr-http": "build/http.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "start": "node build/index.js",
+    "start:http": "node build/http.js",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "dev:http": "node --loader ts-node/esm src/http.ts"
+  },
+  "keywords": [
+    "mcp",
+    "dolibarr",
+    "erp",
+    "crm",
+    "claude",
+    "ai",
+    "model-context-protocol",
+    "accounting",
+    "invoicing"
+  ],
+  "author": "Global Communication Corporate; upstream by Digital Factory Senegal",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Global-C-Corp/Global-Comm-Dolibarr-MCP.git"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.15.0",
+    "dotenv": "^17.4.1",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "eslint": "^10.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.70.1"
+  }
+}
