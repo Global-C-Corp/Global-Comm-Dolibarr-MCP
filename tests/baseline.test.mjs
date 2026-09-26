@@ -13,10 +13,16 @@ process.env.DOLIBARR_API_KEY = 'local-test-placeholder';
 
 const { createServer } = await import('../build/server.js');
 const { DolibarrAPI } = await import('../build/api.js');
+const scopes = ['dolibarr:thirdparties:read', 'dolibarr:contacts:read', 'dolibarr:projects:read', 'dolibarr:commercial:read', 'dolibarr:finance:read'];
 
-async function connectedPair(t) {
+async function connectedPair(t, principal = { subject: 'test-user', clientId: 'test-client', scopes }) {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const server = createServer();
+  const server = createServer({
+    api: new DolibarrAPI('https://example.invalid', 'local-test-placeholder'),
+    resolvePrincipal: () => principal,
+    environment: 'development',
+    audit: { write() {} },
+  });
   const client = new Client({ name: 'baseline-test', version: '1.0.0' });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   t.after(async () => {
@@ -57,7 +63,7 @@ test('direct tools/call rejects writes without reaching the Dolibarr adapter', a
     arguments: { constant: 'LOCAL_TEST_ONLY', value: '1' },
   });
   assert.equal(rejected.isError, true);
-  assert.match(rejected.content[0].text, /unavailable in read-only baseline/);
+  assert.match(rejected.content[0].text, /Access denied/);
   assert.equal(posted, false);
 });
 
@@ -71,6 +77,8 @@ test('direct calls reject raw filters and nonnumeric URL identifiers before ERP 
   const cases = [
     { name: 'list_thirdparties', arguments: { sqlfilters: '(t.nom:like:anything)' } },
     { name: 'get_thirdparty', arguments: { id: '../setup/conf' } },
+    { name: 'list_invoices', arguments: { thirdparty_ids: '1);DROP TABLE invoices' } },
+    { name: 'list_thirdparties', arguments: { limit: 100000 } },
   ];
   for (const request of cases) {
     const result = await client.callTool(request);
@@ -97,11 +105,13 @@ test('an allowed read still uses the original Dolibarr endpoint and pagination',
   assert.match(result.content[0].text, /Fixture client/);
 });
 
-test('HTTP transport exits before listening when authentication is missing', async () => {
+test('HTTP transport exits before listening when identity provider configuration is missing', async () => {
   const child = spawn(process.execPath, ['build/http.js'], {
     env: {
       ...process.env,
-      MCP_API_TOKEN: '',
+      MCP_ENV: 'development',
+      MCP_AUDIT_FILE: '/tmp/global-comm-test-audit-not-created.log',
+      MCP_PUBLIC_URL: '',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -110,5 +120,5 @@ test('HTTP transport exits before listening when authentication is missing', asy
   child.stderr.on('data', chunk => { stderr += chunk; });
   const [code] = await once(child, 'exit');
   assert.equal(code, 1);
-  assert.match(stderr, /MCP_API_TOKEN is required/);
+  assert.match(stderr, /MCP_PUBLIC_URL/);
 });

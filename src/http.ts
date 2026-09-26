@@ -1,159 +1,158 @@
 #!/usr/bin/env node
-/**
- * src/http.ts — Transport HTTP/SSE (Claude.ai web, Cursor remote, Windsurf remote)
- *
- * Point d'entrée HTTP. Importe createServer() depuis server.ts.
- * Compatible MCP spec 2025-11-25 + StreamableHTTPServerTransport
- *
- * Digital Factory Senegal — https://digitalfactory.sn
- */
+/** Local HTTP resource server. External TLS and identity provider are not deployed in Phase 2. */
+import express, { type Request, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import type { OAuthTokenVerifier } from '@modelcontextprotocol/sdk/server/auth/provider.js';
+import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
+import { getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { DolibarrAPI } from './api.js';
+import { createServer } from './server.js';
+import { APP_NAME, APP_VERSION } from './version.js';
+import { FileAuditSink } from './security/audit.js';
+import { loadConfig, type AppConfig } from './security/config.js';
+import { createJwtVerifier, type Principal } from './security/identity.js';
+import dotenv from 'dotenv';
 
-import express, { Request, Response } from "express";
-import { randomUUID } from "node:crypto";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { createServer } from "./server.js";
-import { APP_NAME, APP_VERSION } from "./version.js";
-import dotenv from "dotenv";
+type Session = { transport: StreamableHTTPServerTransport; server: Server; subject: string; clientId: string; lastSeen: number };
 
-dotenv.config();
+export function createHttpApp(config: AppConfig, verifier?: OAuthTokenVerifier) {
+  const http = config.http;
+  if (!http) throw new Error('HTTP configuration required');
+  const audit = new FileAuditSink(config.auditFile);
+  const api = new DolibarrAPI(config.dolibarrUrl, config.dolibarrApiKey);
+  const principalContext = new AsyncLocalStorage<Principal>();
+  const sessions = new Map<string, Session>();
+  const app = express();
+  app.disable('x-powered-by');
+  const metadataUrl = getOAuthProtectedResourceMetadataUrl(http.publicUrl);
+  const bearer = requireBearerAuth({ verifier: verifier ?? createJwtVerifier(http), resourceMetadataUrl: metadataUrl });
 
-const DOLIBARR_URL = process.env.DOLIBARR_URL;
-const DOLIBARR_API_KEY = process.env.DOLIBARR_API_KEY;
-const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const API_TOKEN = process.env.MCP_API_TOKEN;
-
-if (!DOLIBARR_URL || !DOLIBARR_API_KEY) {
-  console.error("❌ Erreur : DOLIBARR_URL et DOLIBARR_API_KEY sont requis.");
-  process.exit(1);
-}
-
-if (!API_TOKEN) {
-  console.error('MCP_API_TOKEN is required for HTTP transport.');
-  process.exit(1);
-}
-
-const app = express();
-app.use(express.json());
-
-// CORS — nécessaire pour Claude.ai web
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, mcp-session-id, Authorization, Last-Event-ID"
-  );
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
-
-// Phase 1: HTTP requires a token; per-user auth is planned for Phase 2.
-function authMiddleware(req: Request, res: Response, next: () => void) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== `Bearer ${API_TOKEN}`) {
-    res.status(401).json({ error: "Token invalide" });
-    return;
-  }
-  next();
-}
-
-// Sessions MCP actives
-const sessions = new Map<string, StreamableHTTPServerTransport>();
-
-setInterval(() => {
-  console.error(`[MCP] Sessions actives : ${sessions.size}`);
-}, 30 * 60 * 1000);
-
-// POST — client → serveur
-app.post("/mcp", authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    let transport: StreamableHTTPServerTransport;
-
-    if (sessionId && sessions.has(sessionId)) {
-      transport = sessions.get(sessionId)!;
-    } else if (!sessionId && isInitializeRequest(req.body)) {
-      const newSessionId = randomUUID();
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => newSessionId,
-        onsessioninitialized: (id) => {
-          sessions.set(id, transport);
-          console.error(`[MCP] Nouvelle session : ${id}`);
-        },
-      });
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-          console.error(`[MCP] Session fermée : ${transport.sessionId}`);
-        }
-      };
-      const server = createServer();
-      await server.connect(transport);
-    } else {
-      res.status(400).json({ error: "Session invalide. Envoyez d'abord une requête d'initialisation." });
-      return;
+  app.use((req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (!http.allowedHosts.has(req.headers.host ?? '')) { res.status(400).json({ error: 'Invalid host' }); return; }
+    const origin = req.headers.origin;
+    if (origin && !http.allowedOrigins.has(origin)) { res.status(403).json({ error: 'Origin not allowed' }); return; }
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
     }
-    await transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error("[MCP] Erreur POST :", err);
-    if (!res.headersSent) res.status(500).json({ error: "Erreur interne" });
-  }
-});
-
-// GET — SSE serveur → client
-app.get("/mcp", authMiddleware, async (req: Request, res: Response) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(404).json({ error: "Session introuvable" });
-    return;
-  }
-  await sessions.get(sessionId)!.handleRequest(req, res);
-});
-
-// DELETE — fermeture de session
-app.delete("/mcp", authMiddleware, async (req: Request, res: Response) => {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (sessionId && sessions.has(sessionId)) {
-    await sessions.get(sessionId)!.close();
-    sessions.delete(sessionId);
-    console.error(`[MCP] Session supprimée : ${sessionId}`);
-  }
-  res.status(204).end();
-});
-
-// Health check
-app.get("/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    service: APP_NAME,
-    version: APP_VERSION,
-    sessions: sessions.size,
-    timestamp: new Date().toISOString(),
+    next();
   });
-});
 
-app.listen(PORT, () => {
-  console.error(`
-╔══════════════════════════════════════════════════════╗
-║         MCP Dolibarr — Serveur HTTP démarré          ║
-╠══════════════════════════════════════════════════════╣
-║  Port     : ${PORT.toString().padEnd(40)}║
-║  Dolibarr : ${(DOLIBARR_URL ?? "").substring(0, 40).padEnd(40)}║
-║  Auth     : ${"Token Bearer activé".padEnd(40)}║
-║  Endpoint : http://localhost:${PORT}/mcp${" ".repeat(Math.max(0, 20 - PORT.toString().length))}║
-╚══════════════════════════════════════════════════════╝
-  `);
-});
+  app.get(new URL(metadataUrl).pathname, (_req, res) => {
+    res.json({ resource: http.publicUrl.toString(), authorization_servers: [http.issuerId],
+      scopes_supported: ['dolibarr:thirdparties:read', 'dolibarr:contacts:read', 'dolibarr:projects:read',
+        'dolibarr:commercial:read', 'dolibarr:finance:read'] });
+  });
+  app.options('/mcp', (req, res) => {
+    if (!req.headers.origin) { res.status(403).end(); return; }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, mcp-session-id, Last-Event-ID');
+    res.status(204).end();
+  });
 
-process.on("SIGTERM", async () => {
-  console.error("[MCP] Arrêt gracieux...");
-  for (const [id, transport] of sessions) {
-    await transport.close();
-    sessions.delete(id);
+  app.use('/mcp', bearer);
+  app.post('/mcp', (req, res, next) => {
+    if (!req.is('application/json')) { res.status(415).json({ error: 'JSON required' }); return; }
+    next();
+  });
+  app.use('/mcp', express.json({ limit: '64kb', strict: true }));
+
+  function getPrincipal(req: Request): Principal | undefined {
+    const subject = req.auth?.extra?.subject;
+    if (!req.auth || typeof subject !== 'string' || !subject) return undefined;
+    return { subject, clientId: req.auth.clientId, scopes: req.auth.scopes };
   }
-  process.exit(0);
-});
+  function findSession(req: Request, principal: Principal): Session | undefined {
+    const id = req.headers['mcp-session-id'];
+    if (typeof id !== 'string') return undefined;
+    const session = sessions.get(id);
+    if (!session || session.subject !== principal.subject || session.clientId !== principal.clientId) return undefined;
+    session.lastSeen = Date.now();
+    return session;
+  }
+
+  app.post('/mcp', async (req: Request, res: Response) => {
+    const principal = getPrincipal(req);
+    if (!principal) { res.status(401).end(); return; }
+    try {
+      let session = findSession(req, principal);
+      if (!session && !req.headers['mcp-session-id'] && isInitializeRequest(req.body)) {
+        if (sessions.size >= 100) { res.status(503).json({ error: 'Too many sessions' }); return; }
+        const id = randomUUID();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => id,
+          onsessioninitialized: sessionId => { if (session) sessions.set(sessionId, session); },
+        });
+        const server = createServer({ api, resolvePrincipal: () => principalContext.getStore(), audit, environment: config.environment });
+        session = { transport, server, subject: principal.subject, clientId: principal.clientId, lastSeen: Date.now() };
+        transport.onclose = () => { sessions.delete(id); };
+        await server.connect(transport);
+      } else if (!session) {
+        res.status(404).json({ error: 'Session unavailable' }); return;
+      }
+      await principalContext.run(principal, () => session.transport.handleRequest(req, res, req.body));
+    } catch {
+      if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  app.get('/mcp', async (req: Request, res: Response) => {
+    const principal = getPrincipal(req);
+    const session = principal && findSession(req, principal);
+    if (!principal || !session) { res.status(404).json({ error: 'Session unavailable' }); return; }
+    try { await principalContext.run(principal, () => session.transport.handleRequest(req, res)); }
+    catch { if (!res.headersSent) res.status(500).json({ error: 'Internal error' }); }
+  });
+
+  app.delete('/mcp', async (req: Request, res: Response) => {
+    const principal = getPrincipal(req);
+    const session = principal && findSession(req, principal);
+    if (!principal || !session) { res.status(404).json({ error: 'Session unavailable' }); return; }
+    try { await session.transport.close(); await session.server.close(); res.status(204).end(); }
+    catch { if (!res.headersSent) res.status(500).json({ error: 'Internal error' }); }
+  });
+
+  app.get('/health', (_req, res) => res.json({ status: 'ok', service: APP_NAME, version: APP_VERSION }));
+  app.use((error: Error, _req: Request, res: Response, _next: () => void) => {
+    void _next;
+    res.status('type' in error && error.type === 'entity.too.large' ? 413 : 400).json({ error: 'Invalid request' });
+  });
+
+  const cleanup = setInterval(() => {
+    for (const [id, session] of sessions) {
+      if (Date.now() - session.lastSeen > 30 * 60 * 1000) {
+        sessions.delete(id);
+        void session.transport.close().then(() => session.server.close()).catch(() => { console.error('[MCP] Session cleanup failed'); });
+      }
+    }
+  }, 60 * 1000);
+  cleanup.unref();
+  return { app, close: async () => {
+    clearInterval(cleanup);
+    for (const session of sessions.values()) { await session.transport.close(); await session.server.close(); }
+    sessions.clear();
+    audit.close();
+  } };
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  dotenv.config();
+  const config = loadConfig(process.env, 'http');
+  const { app, close } = createHttpApp(config);
+  const listener = app.listen(config.http!.port, '127.0.0.1', () => {
+    console.error(`[MCP] Local HTTP listener on 127.0.0.1:${config.http!.port}`);
+  });
+  listener.requestTimeout = 15_000;
+  listener.headersTimeout = 10_000;
+  listener.keepAliveTimeout = 5_000;
+  listener.maxRequestsPerSocket = 100;
+  process.on('SIGTERM', () => { void close().then(() => listener.close()); });
+}
