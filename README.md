@@ -1,12 +1,12 @@
 # Global Comm Dolibarr MCP
 
-This repository is Global Communication Corporate's maintained adaptation of [`digitalfactorysn/mcp-dolibarr`](https://github.com/digitalfactorysn/mcp-dolibarr). See [UPSTREAM.md](UPSTREAM.md) and [LICENSE](LICENSE) for source attribution.
+Global Communication Corporate's adaptation of [`digitalfactorysn/mcp-dolibarr`](https://github.com/digitalfactorysn/mcp-dolibarr). See [UPSTREAM.md](UPSTREAM.md) and [LICENSE](LICENSE) for attribution.
 
-**Current status: Phase 1 read-only baseline, not approved for production connection.** Only 20 inspected read tools are registered; all upstream write handlers remain in the source but are rejected by the MCP dispatcher. Unvalidated `sqlfilters` and `sortfield` are also excluded from the MCP interface. HTTP requires `MCP_API_TOKEN`; this static token is a temporary baseline gate, not per-user authorization or the final ChatGPT connection design. Do not supply a production Dolibarr API key or deploy this branch against `administration.globalcomm.ma`.
+**Phase 2 security foundation; staging development only.** The 20 inspected read tools are governed by explicit scope policies. The upstream write handlers remain in source for review, but no mutation tool is registered or callable. Production Dolibarr is rejected by configuration. No real identity provider or Dolibarr 24 staging installation has been connected or verified.
 
-## Local verification (no ERP connection)
+## Local verification
 
-Requires Node.js 22.13 or newer (Node.js 24 is used by the container).
+Requires Node.js 22.13 or newer. Tests use dummy values, an in-memory MCP transport, local HTTP, and mocked Dolibarr calls; they do not contact an ERP.
 
 ```sh
 npm ci
@@ -15,18 +15,18 @@ npm run lint
 npm test
 ```
 
-Tests use dummy configuration and mock Dolibarr requests. `npm test` builds TypeScript first. The test process does not contact a Dolibarr instance.
+## Configuration
 
-## Architecture and scope
+See [.env.example](.env.example) and the [Phase 2 security foundation](docs/PHASE2_SECURITY_FOUNDATION.md). Explicitly set `MCP_ENV=development` or `staging`, an HTTPS staging `DOLIBARR_URL`, a restricted user key via a secret mechanism, and an absolute private `MCP_AUDIT_FILE`. The stdio process additionally needs `MCP_STDIO_SUBJECT` and `MCP_STDIO_SCOPES`; this local identity is asserted by the process owner.
 
-ChatGPT/Claude clients will speak MCP to this server; a restricted service account will later speak HTTPS REST to Dolibarr. No direct SQL or generic REST escape tool is included. The `src/server.ts` allowlist is a temporary Phase 1 constraint. Phase 2 will introduce caller identity, central policy metadata, permissions, exact-action approvals, idempotency and audit before any write tool is enabled.
+HTTP additionally requires an HTTPS public `/mcp` URL, authorization issuer, JWKS URL and exact audience. Only signed RS256/ES256 JWT access tokens with `sub`, `client_id`, `scope` or `scp`, and `exp` are accepted. The listener binds to `127.0.0.1`; external TLS, an identity provider, a durable audit backend and client interoperability are still pending. CORS has no wildcard and is disabled for browser origins unless explicitly configured.
 
-The upstream source is intentionally retained for inspection; merely seeing a handler in `src/tools` does not mean it is available through MCP. Only names in the current `tools/list` response can be called, and the dispatcher also rejects anything outside the allowlist. Local stdio and HTTP transports share this registry.
+Scopes are `dolibarr:thirdparties:read`, `dolibarr:contacts:read`, `dolibarr:projects:read`, `dolibarr:commercial:read` and `dolibarr:finance:read`. Only tools matching the caller's scopes appear in `tools/list`, and the same policy is checked on every direct `tools/call`.
 
-## Documents
+## Documentation
 
-- [Phase 1 baseline](docs/PHASE1_BASELINE.md): changes, verified checks and open gates.
-- [Phase 0 gap analysis](docs/GAP_ANALYSIS.md) and [upstream tool inventory](docs/UPSTREAM_TOOL_INVENTORY.md): snapshot of upstream at `360cb7c`.
-- [Initial architecture](docs/ARCHITECTURE.md), [security assessment](docs/SECURITY.md) and [MCP upgrade plan](docs/MCP_UPGRADE_PLAN.md).
+- [Phase 2 controls and open gates](docs/PHASE2_SECURITY_FOUNDATION.md)
+- [Phase 1 baseline](docs/PHASE1_BASELINE.md)
+- [Phase 0 gap analysis](docs/GAP_ANALYSIS.md), [upstream inventory](docs/UPSTREAM_TOOL_INVENTORY.md), [initial architecture](docs/ARCHITECTURE.md), [initial security assessment](docs/SECURITY.md) and [upgrade plan](docs/MCP_UPGRADE_PLAN.md)
 
-**Deployment is blocked** until the target Dolibarr 24.x API/permissions, staging environment, remote client authentication and Phase 2 safeguards have been verified. The upstream deployment workflow and scripts have been removed from this branch.
+**No production connection or deployment is approved by this branch.**

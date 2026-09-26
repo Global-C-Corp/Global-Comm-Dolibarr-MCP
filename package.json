@@ -1,6 +1,6 @@
 {
   "name": "global-comm-dolibarr-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Global Comm's restricted Dolibarr MCP integration, derived from digitalfactorysn/mcp-dolibarr.",
   "main": "build/index.js",
@@ -43,7 +43,8 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.15.0",
     "dotenv": "^17.4.1",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "jose": "^6.2.2"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

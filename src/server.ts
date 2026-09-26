@@ -7,6 +7,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import dotenv from "dotenv";
 import { DolibarrAPI } from "./api.js";
 import { APP_NAME, APP_VERSION } from "./version.js";
+import { randomUUID } from 'node:crypto';
+import { TOOL_POLICIES, isAllowed } from './security/policy.js';
+import { auditEvent, type AuditSink } from './security/audit.js';
+import type { Environment } from './security/config.js';
+import type { Principal } from './security/identity.js';
 
 import { thirdpartyTools, handleThirdpartyTool } from "./tools/thirdparties.js";
 import { invoiceTools, handleInvoiceTool } from "./tools/invoices.js";
@@ -56,19 +61,8 @@ const UPSTREAM_TOOLS = [
   ...notificationTools,
 ];
 
-// Phase 1 baseline: publish only inspected read operations. The upstream
-// write handlers remain in source for the policy/authorization work in Phase 2.
-const BASELINE_READ_TOOLS = new Set([
-  'list_thirdparties', 'get_thirdparty', 'get_thirdparty_invoices',
-  'get_thirdparty_proposals', 'get_thirdparty_orders', 'get_thirdparty_contacts',
-  'list_contacts', 'list_projects', 'get_project', 'list_tasks',
-  'list_proposals', 'get_proposal', 'list_orders', 'get_order',
-  'list_supplier_orders', 'get_supplier_order', 'list_invoices', 'get_invoice',
-  'list_supplier_invoices', 'get_supplier_invoice',
-]);
-
 const BLOCKED_FILTERS = new Set(['sqlfilters', 'sortfield']);
-const ALL_TOOLS = UPSTREAM_TOOLS.filter(tool => BASELINE_READ_TOOLS.has(tool.name)).map(tool => ({
+const ALL_TOOLS = UPSTREAM_TOOLS.filter(tool => Object.hasOwn(TOOL_POLICIES, tool.name)).map(tool => ({
   ...tool,
   inputSchema: {
     ...tool.inputSchema,
@@ -79,30 +73,42 @@ const ALL_TOOLS = UPSTREAM_TOOLS.filter(tool => BASELINE_READ_TOOLS.has(tool.nam
 }));
 const READ_TOOLS_BY_NAME = new Map(ALL_TOOLS.map(tool => [tool.name, tool]));
 
-if (ALL_TOOLS.length !== BASELINE_READ_TOOLS.size ||
+if (ALL_TOOLS.length !== Object.keys(TOOL_POLICIES).length ||
     new Set(ALL_TOOLS.map(tool => tool.name)).size !== ALL_TOOLS.length) {
-  throw new Error('Baseline MCP tool registry contains missing or duplicate names');
+  throw new Error('MCP tool registry contains missing or duplicate policy names');
 }
 
+class InputError extends Error {}
 async function routeTool(name: string, args: Record<string, unknown>, api: DolibarrAPI): Promise<string> {
   const tool = READ_TOOLS_BY_NAME.get(name);
   if (!tool) {
-    throw new Error(`Tool unavailable in read-only baseline: ${name}`);
+    throw new InputError('Tool unavailable in read-only baseline');
   }
   const properties = tool.inputSchema.properties || {};
+  if (Object.keys(args).length > 20) throw new InputError('Too many arguments');
   for (const [key, value] of Object.entries(args)) {
     const schema = properties[key] as { type?: string; enum?: unknown[] } | undefined;
-    if (!schema || BLOCKED_FILTERS.has(key)) throw new Error(`Unsupported baseline argument: ${key}`);
+    if (!schema || BLOCKED_FILTERS.has(key)) throw new InputError(`Unsupported baseline argument: ${key}`);
     if (schema.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
-      throw new Error(`Expected a number for ${key}`);
+      throw new InputError(`Expected a number for ${key}`);
     }
     if (schema.type === 'string' && typeof value !== 'string') {
-      throw new Error(`Expected a string for ${key}`);
+      throw new InputError(`Expected a string for ${key}`);
     }
-    if (schema.enum && !schema.enum.includes(value)) throw new Error(`Invalid value for ${key}`);
+    if (schema.type === 'string' && (value as string).length > 256) throw new InputError(`Value too long for ${key}`);
+    if (key === 'thirdparty_ids' && !/^[1-9]\d*(,[1-9]\d*)*$/.test(value as string)) {
+      throw new InputError('Invalid thirdparty_ids');
+    }
+    if (schema.enum && !schema.enum.includes(value)) throw new InputError(`Invalid value for ${key}`);
+    if (schema.type === 'number' && (key === 'id' || key.endsWith('_id') || key === 'limit' || key === 'page') &&
+        (!Number.isSafeInteger(value) || (key === 'page' ? (value as number) < 0 : (value as number) < 1))) {
+      throw new InputError(`Invalid integer for ${key}`);
+    }
+    if (key === 'limit' && (value as number) > 100) throw new InputError('Limit exceeds 100');
+    if (key === 'page' && (value as number) > 1000) throw new InputError('Page exceeds 1000');
   }
   for (const required of tool.inputSchema.required || []) {
-    if (args[required] === undefined) throw new Error(`Missing required argument: ${required}`);
+    if (args[required] === undefined) throw new InputError(`Missing required argument: ${required}`);
   }
   const sets = [
     { tools: thirdpartyTools, h: handleThirdpartyTool },
@@ -145,20 +151,39 @@ async function routeTool(name: string, args: Record<string, unknown>, api: Dolib
   throw new Error(`Outil inconnu : ${name}`);
 }
 
-export function createServer(): Server {
-  const DOLIBARR_URL = process.env.DOLIBARR_URL;
-  const DOLIBARR_API_KEY = process.env.DOLIBARR_API_KEY;
-  if (!DOLIBARR_URL || !DOLIBARR_API_KEY) throw new Error("DOLIBARR_URL et DOLIBARR_API_KEY requis.");
-  const api = new DolibarrAPI(DOLIBARR_URL, DOLIBARR_API_KEY);
+export interface ServerOptions {
+  api: DolibarrAPI;
+  resolvePrincipal: () => Principal | undefined;
+  audit: AuditSink;
+  environment: Environment;
+}
+
+export function createServer({ api, resolvePrincipal, audit, environment }: ServerOptions): Server {
   const server = new Server({ name: APP_NAME, version: APP_VERSION }, { capabilities: { tools: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: ALL_TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: ALL_TOOLS.filter(tool => isAllowed(tool.name, resolvePrincipal(), environment)),
+  }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args } = req.params;
+    const principal = resolvePrincipal();
+    const started = Date.now();
+    const requestId = randomUUID();
+    const safeName = /^[a-z0-9_]{1,64}$/.test(name) ? name : 'invalid_tool_name';
+    const risk = TOOL_POLICIES[name]?.riskLevel ?? 3;
     try {
+      if (!isAllowed(name, principal, environment)) {
+        audit.write(auditEvent(principal, safeName, risk, 'denied', started, requestId));
+        return { content: [{ type: 'text' as const, text: 'Access denied' }], isError: true };
+      }
+      audit.write(auditEvent(principal, safeName, risk, 'started', started, requestId));
       const result = await routeTool(name, (args as Record<string, unknown>) || {}, api);
+      audit.write(auditEvent(principal, safeName, risk, 'succeeded', started, requestId));
       return { content: [{ type: "text" as const, text: result }] };
     } catch (error) {
-      return { content: [{ type: "text" as const, text: `❌ ${error instanceof Error ? error.message : 'Erreur inconnue'}` }], isError: true };
+      try { audit.write(auditEvent(principal, safeName, risk, 'failed', started, requestId)); }
+      catch { console.error('[MCP] Audit unavailable'); }
+      const message = error instanceof InputError ? error.message : 'Operation unavailable';
+      return { content: [{ type: 'text' as const, text: message }], isError: true };
     }
   });
   return server;

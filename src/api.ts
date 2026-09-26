@@ -21,6 +21,9 @@ export class DolibarrAPI {
         'DOLAPIKEY': apiKey,
       },
       timeout: 30000,
+      maxRedirects: 0,
+      maxContentLength: 1024 * 1024,
+      maxBodyLength: 64 * 1024,
     });
 
     // Interceptor for clean error messages
@@ -29,21 +32,12 @@ export class DolibarrAPI {
       (error) => {
         if (error.response) {
           const status = error.response.status;
-          const data = error.response.data;
-          const message = data?.error?.message || data?.message || data?.error || error.message;
-          
-          let context = '';
-          if (status === 401) context = ' (Clé API invalide ou permissions insuffisantes)';
-          if (status === 403) context = ' (Accès non autorisé à cette ressource)';
-          if (status === 404) context = ' (Ressource introuvable - vérifiez que le module est activé dans Dolibarr)';
-          if (status === 500) context = ' (Erreur interne Dolibarr - vérifiez les logs)';
-          
-          throw new Error(`Dolibarr API Error [${status}]${context}: ${message}`);
+          throw new Error(`Dolibarr API returned HTTP ${status}`);
         }
         if (error.request) {
-          throw new Error(`Dolibarr: Pas de réponse du serveur. Vérifiez que l'URL ${this.baseURL} est accessible.`);
+          throw new Error('Dolibarr API did not respond');
         }
-        throw new Error(`Dolibarr Request Error: ${error.message}`);
+        throw new Error('Dolibarr API request failed');
       }
     );
   }
